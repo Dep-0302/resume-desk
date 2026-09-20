@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2 — 2026-09-20
+
+Documentation-only source preview; application behavior is unchanged.
+
+- Make the source-preview status and missing installer/Agent integration explicit on the homepage.
+- Add concise current trial instructions, a manual Codex handoff prompt, and a clearly labeled future roadmap.
+- Separate QA/developer commands from installation, and explain test data versus real recovery.
+- Keep the classic panel plus required backend as the only product in this repository.
+
 ## 0.1.1 — 2026-09-20
 
 Correct the release scope to the classic floating panel (01B) and required recovery/reminder backend (01A).

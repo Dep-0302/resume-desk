@@ -1,5 +1,7 @@
 # 回顾与提醒运行方法
 
+首次试用先看 [INSTALL.md](INSTALL.md)。本文是当前手动／开发接入契约，不代表已经提供自动连接 Skill。
+
 这是 01A 的可移植执行入口，搭配 01B 经典浮窗使用。它不包含原开发者的私人任务、固定定时器或账号设置。
 
 ## 每次执行
@@ -20,7 +22,7 @@ python3 Recovery/recovery.py report --mode manual
 python3 Recovery/recovery.py panel-read
 ```
 
-`reviewed.json` 是 Agent 核对后的接口输入，不能直接把原始扫描结果当作已经审核的结论。数据结构与真实验证例子见 `Recovery/test_recovery.py`、`Recovery/test_panel.py` 和 `Recovery/test_omission_recovery.py`。
+`reviewed.json` 是 Agent 核对后在用户数据目录生成的接口输入，不是仓库附带文件；调用时使用它的实际路径。不能直接把原始扫描结果当作已经审核的结论。数据结构与真实验证例子见 `Recovery/test_recovery.py`、`Recovery/test_panel.py` 和 `Recovery/test_omission_recovery.py`。
 
 ## 不丢事项，也不制造待办
 
