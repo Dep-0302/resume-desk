@@ -1,18 +1,20 @@
 # 普通用户版计划（尚未实现）
 
-首发面向 **macOS＋Codex**，包括不懂命令行的用户。目标流程：
+首发面向 **macOS＋Codex**，包括不懂命令行的用户。先完成最低标准：
 
-**下载 App → 完成首次连接授权 → Codex 核对真实对话 → 浮窗显示。**
+**用户交给 Agent 仓库链接 → Agent 检查环境并安装 → 经用户授权核对自己的 Codex 记录 → 浮窗显示并验证正常使用。**
+
+用户不应自行编译或填写 JSON。Agent 应给出安装结果、真实回顾结果及再次启动／刷新方法；环境不满足时说明缺项，不用假数据替代。完整流程目前尚未实现和验收。
 
 ## 按顺序补齐
 
 | 阶段 | 交付内容 | 通过条件 |
 |---|---|---|
-| 1. Agent 接入 | 可安装的接线包：初始化、自检、核对、校验导入、成功回执 | 用户无需手写 JSON，能得到第一份真实回顾 |
+| 1. Agent 安装与接入 | 明确的仓库入口、环境检查、安装／启动工具、真实核对、导入和结果自检 | 用户只提供仓库链接和必要授权，能正常使用并再次启动／刷新 |
 | 2. 首次使用 | 连接向导、自带运行环境、未连接／待核对／空列表／失败状态 | 不要求用户安装 Python、编译或操作终端 |
 | 3. 普通用户发布 | 已验证架构的安装包、Developer ID 签名与公证、更新和卸载说明 | 从 Release 下载到干净 Mac 后可完成首次使用，升级保留注意状态 |
 
-Skill 定义核对流程，定时任务另行设置；首次回顾通过后才让用户选择自动运行。对外可复用分发优先采用[包含 Skill 的插件](https://learn.chatgpt.com/docs/build-skills)。[Mac 分发依据](https://developer.apple.com/help/account/certificates/create-developer-id-certificates)。
+先保证仓库本身能被 Agent 正确安装和接入；可安装 Skill／插件用于后续复用，不以完成 DMG 作为第一阶段的前提。定时任务另行设置，首次回顾通过后才让用户选择自动运行。[Skill 分发参考](https://learn.chatgpt.com/docs/build-skills) · [Mac 分发依据](https://developer.apple.com/help/account/certificates/create-developer-id-certificates)。
 
 ## 仓库与介绍安排
 
