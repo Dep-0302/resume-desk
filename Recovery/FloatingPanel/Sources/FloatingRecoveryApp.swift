@@ -1733,6 +1733,11 @@ private struct TestInteractionEvent: Codable {
 
 private struct DiagnosticsSnapshot: Codable {
     let visible: Bool
+    let backendLoaded: Bool
+    let backendRevision: String?
+    let appVersion: String
+    let testMode: Bool
+    let processID: Int32
     let expandedProject: String?
     let projectCount: Int
     let itemCount: Int
@@ -1744,6 +1749,11 @@ private struct DiagnosticsSnapshot: Codable {
 
     enum CodingKeys: String, CodingKey {
         case visible
+        case backendLoaded = "backend_loaded"
+        case backendRevision = "backend_revision"
+        case appVersion = "app_version"
+        case testMode = "test_mode"
+        case processID = "process_id"
         case expandedProject = "expanded_project"
         case projectCount = "project_count"
         case itemCount = "item_count"
@@ -1757,6 +1767,11 @@ private struct DiagnosticsSnapshot: Codable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encode(visible, forKey: .visible)
+        try container.encode(backendLoaded, forKey: .backendLoaded)
+        try container.encodeIfPresent(backendRevision, forKey: .backendRevision)
+        try container.encode(appVersion, forKey: .appVersion)
+        try container.encode(testMode, forKey: .testMode)
+        try container.encode(processID, forKey: .processID)
         if let expandedProject {
             try container.encode(expandedProject, forKey: .expandedProject)
         } else {
@@ -2056,6 +2071,11 @@ private final class FloatingPanelDelegate: NSObject, NSApplicationDelegate {
         let view = panelView
         let snapshot = DiagnosticsSnapshot(
             visible: windowController.isVisible,
+            backendLoaded: view != nil,
+            backendRevision: view?.revision,
+            appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
+            testMode: configuration.testMode,
+            processID: ProcessInfo.processInfo.processIdentifier,
             expandedProject: expandedProjectKey,
             projectCount: view?.projects.count ?? 0,
             itemCount: view?.projects.reduce(0) { $0 + $1.items.count } ?? 0,

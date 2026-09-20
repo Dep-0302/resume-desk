@@ -9,7 +9,7 @@ zsh scripts/check-native.sh
 
 前者检查后端、构建和发布内容；后者需要 macOS 图形会话，会打开临时合成窗口。`Recovery/FloatingPanel/Tests/六项假数据准备.py` 仅用于制作 QA 数据，不属于正常启动流程。
 
-发布源码范围：`Recovery/` 为现有后端与浮窗，`scripts/` 为构建／验证／打包，`docs/` 为说明。生产 App 不携带运行状态或测试任务。
+发布源码范围：`Recovery/` 为现有后端与浮窗，`scripts/` 为 Agent 控制器及构建／验证／打包，`docs/` 为说明，`.agents/skills/resume-desk/` 为仓库内 Agent 指引。生产 App 不携带运行状态或测试任务。
 
 可选预览包流程：
 

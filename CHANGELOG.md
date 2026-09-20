@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.0 — 2026-09-20
+
+Agent-assisted installation for macOS + Codex desktop.
+
+- Add a concise copyable installation prompt, repository-local Skill and deterministic install/review controller.
+- Install versioned classic App bundles while preserving recovery data and a reusable installed controller.
+- Export bounded local Codex evidence for Agent review; validate complete batches, source freshness and attention decisions before atomic import.
+- Separate installation, review readiness and native display verification; never substitute QA data for user records.
+- Add isolated installer, protocol and source-to-panel regression coverage.
+
+Requires Apple command-line tools. No signed/notarized binary, bundled runtime, global Skill or automatic scheduler is provided.
+
 ## 0.1.2 — 2026-09-20
 
 Documentation-only source preview; application behavior is unchanged.

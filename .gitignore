@@ -19,3 +19,7 @@ Runtime*/
 **/latest-report.json
 **/Inbox/
 **/ResumeCommands/
+
+**/AgentReview/
+**/install.json
+**/config.json

@@ -1,7 +1,7 @@
 # 一个恢复核心，一个桌面入口
 
 ```text
-Codex 本地记录 / 已核实的 App 导入
+Codex 本地记录 → Agent 逐条核对 / 已核实的 App 导入
                  │
           recovery.py（01A）
                  │
@@ -25,3 +25,7 @@ Codex 本地记录 / 已核实的 App 导入
 - 不读取或写入未完成独立 App 的摘要状态、来源配置或收件箱。
 
 Git 仓库和发布包只管理这套经典浮窗。运行数据与未发布研发材料应保留在仓库外。
+
+## Agent 安装与核对
+
+`scripts/agent.py` 负责检查环境、按版本安装及调用随包后端；`INSTALL_AGENT.md` 和仓库内 Skill 指导 Agent 判断。控制器不调用模型，不把记录关键词自动变成待办。后端通过 `agent-export`／`agent-apply`／`agent-status` 管理批次，正常浮窗仍只用 `panel-read`／`panel-action`。协议见 [AGENT_PROTOCOL.md](AGENT_PROTOCOL.md)。

@@ -33,7 +33,9 @@ source_names = subprocess.check_output(
 ).decode().split('\0')
 for name in set(source_names) - {''}:
     rel = Path(name)
-    allowed_roots = {'Recovery', 'scripts', 'docs', '.github', '.gitignore', 'AGENTS.md', 'CHANGELOG.md', 'NOTICE.md', 'README.md', 'VERSION', 'build.sh'}
+    allowed_roots = {'Recovery', 'scripts', 'docs', '.github', '.gitignore', 'AGENTS.md', 'CHANGELOG.md', 'NOTICE.md', 'README.md', 'VERSION', 'build.sh', '.agents', 'INSTALL_AGENT.md'}
+    if rel.parts[0] == '.agents' and not name.startswith('.agents/skills/resume-desk/'):
+        errors.append(f'Unexpected project skill: {name}')
     if rel.parts[0] not in allowed_roots:
         errors.append(f'File outside classic-panel release scope: {name}')
     if any(part in SKIP or part.startswith('Runtime') for part in rel.parts[:-1]):

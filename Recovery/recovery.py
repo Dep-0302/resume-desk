@@ -5,6 +5,7 @@ Only reads Codex's database/session files. All writes stay in --state-dir.
 No model calls, daemon, guessed read receipts, or conversation mutations.
 """
 import argparse
+import copy
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
@@ -27,6 +28,10 @@ HIDDEN = {'done', 'in_progress', 'settled'}
 PROGRESS_FOLLOWUP_SECONDS = 48 * 60 * 60
 PROGRESS_REPEAT_SECONDS = 7 * 24 * 60 * 60
 RESUME_CONTEXT_FIELDS = ('previous_focus', 'current_state', 'next_step')
+# A source JSONL tail is bounded at 256 KiB. Keep each selected question or
+# final answer comfortably within that evidence window; larger messages are
+# explicitly marked incomplete rather than silently cut and accepted.
+AGENT_EVIDENCE_LIMIT = 16_000
 
 
 def now():
@@ -60,6 +65,17 @@ def user_text(value):
     if value.startswith(('<', '# AGENTS.md instructions', '【01 断点复原｜历史证据】')):
         return ''
     return value
+
+
+def agent_evidence_text(value):
+    """Return a separately bounded review excerpt and whether it was cut.
+
+    The regular recovery fingerprint intentionally keeps its older 2400-character
+    representation. Agent batches use the digest of the uncut selected messages
+    below, so a suffix change cannot silently reuse an old review.
+    """
+    text = clean(value, AGENT_EVIDENCE_LIMIT)
+    return text, text.endswith('…〔节选〕')
 
 
 def parse_records(records):
@@ -98,10 +114,16 @@ def parse_records(records):
                 user, ut = candidate, stamp
             elif p.get('role') == 'assistant' and p.get('phase') in (None, 'final', 'final_answer') and text.strip():
                 answer, at = text, stamp
+    agent_question, question_truncated = agent_evidence_text(user)
+    agent_answer, answer_truncated = agent_evidence_text(answer)
     return {'question': clean(user), 'answer': clean(answer), 'user_at': ut,
             'answer_at': at, 'lifecycle': lifecycle,
             'progress_markers': progress_markers[-12:], 'turn_id': current_turn,
-            'no_reply_after_answer': bool(answer), 'read_state': 'unknown'}
+            'no_reply_after_answer': bool(answer), 'read_state': 'unknown',
+            'agent_question': agent_question, 'agent_answer': agent_answer,
+            'question_truncated': question_truncated, 'answer_truncated': answer_truncated,
+            'agent_source_digest': digest({'question': user, 'answer': answer,
+                                           'user_at': ut, 'answer_at': at})}
 
 
 def fingerprint(evidence):
@@ -340,15 +362,19 @@ def write_json(path, data):
 
 def scan(state, home, max_files=128, max_bytes=32*1024*1024, seconds=15):
     start = time.monotonic()
-    connection = sqlite3.connect((home / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=1)
-    connection.row_factory = sqlite3.Row
+    connection = None
     try:
+        connection = sqlite3.connect((home / 'state_5.sqlite').as_uri() + '?mode=ro', uri=True, timeout=1)
+        connection.row_factory = sqlite3.Row
         connection.execute('PRAGMA query_only=ON')
         rows = [dict(r) for r in connection.execute(
             "SELECT id,title,cwd,rollout_path,archived,source,updated_at,first_user_message FROM threads WHERE source NOT LIKE '{%' ORDER BY updated_at DESC,id")]
+    except sqlite3.Error as exc:
+        raise ValueError('无法读取 Codex 本地索引：' + clean(str(exc), 180)) from exc
     finally:
-        connection.close()
-    used, visited, pending, failures = 0, 0, 0, []
+        if connection is not None:
+            connection.close()
+    used, visited, pending, failures, pending_ids = 0, 0, 0, [], []
     bases = [(home / n).resolve() for n in ('sessions', 'archived_sessions')]
     for row in rows:
         entry = state['threads'].setdefault(row['id'], {'id': row['id'], 'provider': 'codex_local'})
@@ -362,11 +388,14 @@ def scan(state, home, max_files=128, max_bytes=32*1024*1024, seconds=15):
                 raise ValueError('会话路径超出原生记录目录')
             before = path.stat()
             signature = [before.st_mtime_ns, before.st_size]
-            if entry.get('file_signature') == signature:
+            # Old state files predate the Agent source digest. Read each unchanged
+            # session once to establish it, while preserving the legacy fingerprint.
+            if entry.get('file_signature') == signature and entry.get('evidence', {}).get('agent_source_digest'):
                 continue
             size = min(before.st_size, 256*1024)
             if visited >= max_files or used + size > max_bytes or time.monotonic() - start >= seconds:
                 pending += 1
+                pending_ids.append(row['id'])
                 continue
             with path.open('rb') as f:
                 offset = max(0, before.st_size - size)
@@ -387,6 +416,7 @@ def scan(state, home, max_files=128, max_bytes=32*1024*1024, seconds=15):
             after = path.stat()
             if signature != [after.st_mtime_ns, after.st_size]:
                 pending += 1
+                pending_ids.append(row['id'])
                 entry['scan_issue'] = '读取时会话仍在变化，下次重读'
                 continue
             ev = parse_records(records)
@@ -417,6 +447,7 @@ def scan(state, home, max_files=128, max_bytes=32*1024*1024, seconds=15):
             entry['available'] = entry['id'] in known
     coverage = {'at': now(), 'indexed': len(rows), 'read_this_pass': visited,
                 'bytes_this_pass': used, 'pending_changed_or_unread': pending,
+                'pending_ids': pending_ids,
                 'failures': failures, 'includes_archived': True,
                 'scope': '本机全部非子代理 Codex 对话；正文为末尾 256 KiB 节选，缺失需 App 深读'}
     state['sources']['codex_local'] = coverage
@@ -576,8 +607,14 @@ def assess_attention(state, updates):
             raise ValueError('未知进展判断')
         quote = change.get('pending_quote', '')
         if decision == 'needs_user':
-            if (not quote or not change.get('review_point')
-                    or not any(quote in (ev.get(k) or '') for k in ('question', 'answer'))):
+            agent_digest = change.get('agent_source_digest')
+            if agent_digest:
+                quoted_evidence = agent_safe_evidence(entry)
+                quote_matches = (agent_digest == agent_source_fingerprint(entry)
+                                 and any(quote in (quoted_evidence.get(k) or '') for k in ('question', 'answer')))
+            else:
+                quote_matches = any(quote in (ev.get(k) or '') for k in ('question', 'answer'))
+            if not quote or not change.get('review_point') or not quote_matches:
                 raise ValueError('新待处理内容须附原文依据和具体停点')
         if decision == 'progressed_no_pending':
             proof = change.get('progress_evidence') or {}
@@ -612,7 +649,8 @@ def assess_attention(state, updates):
             continue
         entry['attention_assessment'] = {k: change.get(k) for k in (
             'decision', 'based_on', 'source_thread', 'reason', 'pending_quote',
-            'progress_evidence', 'no_pending_user_action', 'no_pending_quote', 'review_point')}
+            'progress_evidence', 'no_pending_user_action', 'no_pending_quote', 'review_point',
+            'agent_source_digest')}
         entry['attention_assessment']['at'] = now()
         if change['decision'] == 'needs_user':
             entry['review_note'] = {'text': clean(change['review_point'], 600),
@@ -634,8 +672,10 @@ def attention_hidden(state, entry):
     if current and assessment.get('decision') == 'progressed_no_pending':
         return True
     if control.get('mode') == 'taken':
+        newer_agent_evidence = (control.get('agent_source_digest') and assessment.get('agent_source_digest')
+                                and assessment.get('agent_source_digest') != control.get('agent_source_digest'))
         return not (current and assessment.get('decision') == 'needs_user'
-                    and control.get('based_on') != entry.get('fingerprint'))
+                    and (control.get('based_on') != entry.get('fingerprint') or newer_agent_evidence))
     return False
 
 
@@ -813,6 +853,10 @@ def merge_panel_report(state, result):
             'updated_at': iso_time(item.get('updated_at')) or result.get('generated_at') or '',
             'first_seen_at': old.get('first_seen_at') or result.get('generated_at'),
             'source_report_at': result.get('generated_at')}
+        if item.get('agent_source_digest'):
+            panel['items'][entry['id']]['agent_source_digest'] = item['agent_source_digest']
+        elif old.get('agent_source_digest'):
+            panel['items'][entry['id']]['agent_source_digest'] = old['agent_source_digest']
         if item.get('resume_context'):
             panel['items'][entry['id']]['resume_context'] = item['resume_context']
     # Daily assessments also cover previously displayed items omitted from this batch.
@@ -825,6 +869,8 @@ def merge_panel_report(state, result):
                         title=entry.get('app_title') or entry.get('title') or item['title'],
                         project=project_for(state, entry), source_report_at=result.get('generated_at'),
                         updated_at=iso_time(entry.get('updated_at')) or result.get('generated_at') or '')
+            if assessment.get('agent_source_digest'):
+                item['agent_source_digest'] = assessment['agent_source_digest']
             item.pop('resume_context', None)
         fb = entry.get('feedback', {})
         if (fb.get('based_on') == entry.get('fingerprint') and fb.get('status') in ('unread','forgotten','unverified','awaiting_input')
@@ -841,7 +887,7 @@ def merge_panel_report(state, result):
 def panel_item_token(state, item):
     entry = state['threads'].get(item['id'], {})
     return digest({'id': item['id'], 'shown_fingerprint': item['fingerprint'],
-                   'shown_row': {k: item.get(k) for k in ('title', 'review_point', 'resume_context', 'project', 'navigation', 'source_report_at', 'updated_at')},
+                   'shown_row': {k: item.get(k) for k in ('title', 'review_point', 'resume_context', 'project', 'navigation', 'source_report_at', 'updated_at', 'agent_source_digest')},
                    'current_fingerprint': entry.get('fingerprint'),
                    'control': state.get('attention_controls', {}).get(item['id']),
                    'feedback': entry.get('feedback'), 'assessment': entry.get('attention_assessment')})
@@ -907,6 +953,8 @@ def panel_view(state, latest=None):
                 or (fb.get('status') in HIDDEN and fb.get('based_on') == entry.get('fingerprint'))):
             continue
         current = item['fingerprint'] == entry.get('fingerprint')
+        if item.get('agent_source_digest'):
+            current = current and item['agent_source_digest'] == agent_source_fingerprint(entry)
         row = dict(item)
         # Refresh source metadata in this read-only projection, including old
         # queued rows. The source project and user attention state stay intact.
@@ -971,7 +1019,432 @@ def panel_action(state, latest, sid, action, token):
         'mode': 'taken' if action == 'take' else 'dismissed', 'based_on': item['fingerprint'],
         'at': now(), 'source': 'native_panel',
         'meaning': '用户已接手或有推进，不等于完成' if action == 'take' else '用户永久不再关注该对话'}
+    if item.get('agent_source_digest'):
+        state['attention_controls'][sid]['agent_source_digest'] = item['agent_source_digest']
     return panel_view(state)
+
+
+AGENT_REVIEW_SCHEMA_VERSION = 1
+AGENT_DECISIONS = {'needs_user', 'no_action', 'unknown'}
+
+
+def agent_safe_evidence(entry):
+    """The Agent hand-off deliberately contains conversational evidence only.
+
+    JSONL tool calls, thoughts and raw event payloads never cross this boundary.
+    ``parse_records`` has already selected the user message and final answer.
+    """
+    evidence = entry.get('evidence', {})
+    return {
+        'question': evidence.get('agent_question', evidence.get('question', '')),
+        'answer': evidence.get('agent_answer', evidence.get('answer', '')),
+        'user_at': evidence.get('user_at', ''), 'answer_at': evidence.get('answer_at', ''),
+        'lifecycle': evidence.get('lifecycle', ''), 'tail_only': evidence.get('tail_only', False),
+        'missing_question': evidence.get('missing_question', False),
+        'question_truncated': evidence.get('question_truncated', False),
+        'answer_truncated': evidence.get('answer_truncated', False),
+    }
+
+
+def agent_safe_project(state, entry):
+    project = project_for(state, entry)
+    return {key: project.get(key) for key in ('key', 'label', 'source_kind')}
+
+
+def agent_is_running(entry):
+    return entry.get('app_status') == 'active' or entry.get('evidence', {}).get('lifecycle') == 'task_started'
+
+
+def agent_is_permanently_dismissed(state, entry):
+    return state.get('attention_controls', {}).get(entry.get('id'), {}).get('mode') == 'dismissed'
+
+
+def agent_evidence_complete(entry):
+    evidence = agent_safe_evidence(entry)
+    return bool(evidence.get('question') and evidence.get('answer')
+                and not evidence.get('question_truncated') and not evidence.get('answer_truncated'))
+
+
+def agent_source_fingerprint(entry):
+    evidence = entry.get('evidence', {})
+    # Existing state can lack this field until scan establishes it once. The
+    # fallback retains compatibility but is never used for a newly exported scan.
+    return evidence.get('agent_source_digest') or digest({
+        'question': evidence.get('question', ''), 'answer': evidence.get('answer', ''),
+        'user_at': evidence.get('user_at', ''), 'answer_at': evidence.get('answer_at', '')})
+
+
+def agent_batch_token():
+    return hashlib.sha256((now() + ':' + os.urandom(24).hex()).encode()).hexdigest()
+
+
+def agent_source_metadata(home):
+    home = Path(home).resolve()
+    default_home = (Path.home() / '.codex').resolve()
+    return {'source_home': str(home),
+            'source_kind': 'default_codex' if home == default_home else 'custom_codex'}
+
+
+def agent_control_snapshot(state, sid):
+    control = state.get('attention_controls', {}).get(sid, {})
+    return {key: control.get(key) for key in ('mode', 'based_on', 'agent_source_digest', 'at', 'source', 'meaning')}
+
+
+def agent_control_matches_entry(control, entry):
+    """Old controls only know the legacy fingerprint; do not reinterpret them."""
+    if control.get('agent_source_digest'):
+        return control['agent_source_digest'] == agent_source_fingerprint(entry)
+    return control.get('based_on') == entry.get('fingerprint')
+
+
+def agent_coverage(scan_coverage, exclusions, missing_evidence, truncated_evidence, excerpt_count):
+    """Turn bounded scanner details into a stable Agent-review coverage contract."""
+    gaps = []
+    pending = scan_coverage.get('pending_changed_or_unread', 0)
+    failures = scan_coverage.get('failures', [])
+    if pending:
+        gaps.append({'code': 'pending_source_reads', 'count': pending})
+    if failures:
+        gaps.append({'code': 'source_read_failures', 'count': len(failures)})
+    if missing_evidence:
+        gaps.append({'code': 'missing_current_evidence', 'count': missing_evidence})
+    if truncated_evidence:
+        gaps.append({'code': 'agent_evidence_truncated', 'count': truncated_evidence})
+    return {
+        'source': 'codex_local',
+        'indexed': scan_coverage.get('indexed', 0),
+        'eligible': 0,
+        'excluded': exclusions,
+        'read_this_pass': scan_coverage.get('read_this_pass', 0),
+        'pending_changed_or_unread': pending,
+        'failures': len(failures),
+        'excerpt_count': excerpt_count,
+        'gaps': gaps,
+        'complete': not gaps,
+        'scope': '仅本机非子代理 Codex 会话；导出仅含用户问题与最终答复的有界节选，不能声称已覆盖更早历史。',
+    }
+
+
+def agent_review_scope(state, explicit=(), current_thread=''):
+    """Select the complete local-Codex review scope without changing state."""
+    explicit = {str(value) for value in explicit if str(value)}
+    exclusions = {'archived': 0, 'permanently_dismissed': 0, 'taken_current': 0, 'running': 0,
+                  'explicit': 0, 'current_agent_thread': 0}
+    items, missing_evidence, truncated_evidence, excerpt_count = [], 0, 0, 0
+    entries = [entry for entry in state.get('threads', {}).values()
+               if entry.get('provider') == 'codex_local' and entry.get('available') is not False]
+    for entry in sorted(entries, key=lambda value: (value.get('updated_at') or 0, value.get('id') or ''), reverse=True):
+        sid = str(entry.get('id') or '')
+        if entry.get('archived') is True:
+            exclusions['archived'] += 1
+            continue
+        if agent_is_permanently_dismissed(state, entry):
+            exclusions['permanently_dismissed'] += 1
+            continue
+        control = state.get('attention_controls', {}).get(sid, {})
+        if control.get('mode') == 'taken' and agent_control_matches_entry(control, entry):
+            exclusions['taken_current'] += 1
+            continue
+        if agent_is_running(entry):
+            exclusions['running'] += 1
+            continue
+        if sid in explicit:
+            exclusions['explicit'] += 1
+            continue
+        if current_thread and sid == current_thread:
+            exclusions['current_agent_thread'] += 1
+            continue
+        evidence = agent_safe_evidence(entry)
+        source_fingerprint = agent_source_fingerprint(entry)
+        if not sid or not source_fingerprint:
+            missing_evidence += 1
+            continue
+        if evidence.get('tail_only'):
+            excerpt_count += 1
+        items.append({'id': sid, 'title': clean(entry.get('app_title') or entry.get('title'), 300),
+                      'project': agent_safe_project(state, entry), 'fingerprint': source_fingerprint,
+                      'evidence': evidence, 'evidence_complete': agent_evidence_complete(entry)})
+        if not evidence.get('question') or not evidence.get('answer'):
+            missing_evidence += 1
+        if evidence.get('question_truncated') or evidence.get('answer_truncated'):
+            truncated_evidence += 1
+    return items, exclusions, missing_evidence, truncated_evidence, excerpt_count
+
+
+def agent_export(state, home, exclude_ids=()):
+    """Create an explicit, evidence-bound review batch from local Codex records."""
+    home = home.resolve()
+    scan_coverage = scan(state, home)
+    explicit = {str(value) for value in exclude_ids if str(value)}
+    current_thread = os.environ.get('CODEX_THREAD_ID', '').strip()
+    items, exclusions, missing_evidence, truncated_evidence, excerpt_count = agent_review_scope(state, explicit, current_thread)
+    coverage = agent_coverage(scan_coverage, exclusions, missing_evidence, truncated_evidence, excerpt_count)
+    coverage['eligible'] = len(items)
+    source = agent_source_metadata(home)
+    token = agent_batch_token()
+    review = state.setdefault('agent_review', {'schema_version': AGENT_REVIEW_SCHEMA_VERSION, 'batches': {}})
+    if review.get('schema_version') != AGENT_REVIEW_SCHEMA_VERSION:
+        raise ValueError('Agent 核对批次版本不兼容')
+    batches = review.setdefault('batches', {})
+    batches[token] = {
+        'schema_version': AGENT_REVIEW_SCHEMA_VERSION,
+        'created_at': now(),
+        'source': 'codex_local',
+        'home': source['source_home'],
+        **source,
+        'explicit_exclude_ids': sorted(explicit),
+        'current_agent_thread': current_thread or None,
+        'items': {item['id']: item['fingerprint'] for item in items},
+        'control_snapshot': {item['id']: agent_control_snapshot(state, item['id']) for item in items},
+        'coverage': coverage,
+    }
+    # Batches contain only hashes and counts, but retaining an unlimited history
+    # still turns a local state file into an unnecessary audit archive.
+    older = sorted(batches, key=lambda key: batches[key].get('created_at', ''), reverse=True)[12:]
+    for old in older:
+        del batches[old]
+    review['latest_batch_token'] = token
+    return {'schema_version': AGENT_REVIEW_SCHEMA_VERSION, 'batch_token': token,
+            'coverage': coverage, 'items': items}
+
+
+def agent_current_pending(entry):
+    assessment = entry.get('attention_assessment', {})
+    if (assessment.get('based_on') == entry.get('fingerprint')
+            and assessment.get('decision') == 'needs_user'):
+        assessment_digest = assessment.get('agent_source_digest')
+        if not assessment_digest or assessment_digest == agent_source_fingerprint(entry):
+            return True
+    feedback_state = entry.get('feedback', {})
+    return (feedback_state.get('based_on') == entry.get('fingerprint')
+            and feedback_state.get('status') in ('unread', 'forgotten', 'unverified', 'awaiting_input'))
+
+
+def agent_quote_matches(entry, quote):
+    evidence = agent_safe_evidence(entry)
+    return bool(quote and any(quote in str(evidence.get(key) or '') for key in ('question', 'answer')))
+
+
+def agent_quote_matches_legacy_evidence(entry, quote):
+    evidence = entry.get('evidence', {})
+    return bool(quote and any(quote in str(evidence.get(key) or '') for key in ('question', 'answer')))
+
+
+def agent_concrete_review_point(value):
+    text = clean(value, 600).strip() if isinstance(value, str) else ''
+    generic = r'(?:待处理|需处理|需要处理|待用户处理|待确认|未知|unknown|请处理)[。！.!？? ]*'
+    if len(text) < 8 or re.fullmatch(generic, text, re.IGNORECASE):
+        raise ValueError('needs_user 必须给出具体的 review_point')
+    return text
+
+
+def agent_validate_payload(payload, batch, state):
+    if not isinstance(payload, dict) or set(payload) != {'schema_version', 'batch_token', 'decisions'}:
+        raise ValueError('Agent 核对文件必须只包含 schema_version、batch_token 和 decisions')
+    if payload.get('schema_version') != AGENT_REVIEW_SCHEMA_VERSION:
+        raise ValueError('Agent 核对文件版本不兼容')
+    decisions = payload.get('decisions')
+    if not isinstance(decisions, list):
+        raise ValueError('decisions 必须是数组')
+    expected = batch.get('items')
+    if not isinstance(expected, dict):
+        raise ValueError('Agent 核对批次损坏')
+    by_id = {}
+    for decision in decisions:
+        if not isinstance(decision, dict):
+            raise ValueError('每条 Agent 决定必须是对象')
+        allowed = {'id', 'fingerprint', 'decision', 'reason', 'evidence_quote', 'review_point', 'resume_context'}
+        if set(decision) - allowed or not {'id', 'fingerprint', 'decision', 'reason', 'evidence_quote'} <= set(decision):
+            raise ValueError('Agent 决定字段不合法')
+        sid = decision.get('id')
+        if not isinstance(sid, str) or sid in by_id:
+            raise ValueError('每个批次 ID 必须恰好有一条决定')
+        if sid not in expected or decision.get('fingerprint') != expected[sid]:
+            raise ValueError('Agent 决定未绑定导出批次的当前指纹')
+        if decision.get('decision') not in AGENT_DECISIONS or not isinstance(decision.get('reason'), str) or not decision['reason'].strip():
+            raise ValueError('Agent 决定类型或理由不合法')
+        quote = decision.get('evidence_quote')
+        if not isinstance(quote, str):
+            raise ValueError('evidence_quote 必须是字符串')
+        by_id[sid] = decision
+    if set(by_id) != set(expected):
+        raise ValueError('Agent 决定必须完整覆盖该批次，且不能包含其他 ID')
+    normalized = []
+    for sid, decision in by_id.items():
+        entry = state.get('threads', {}).get(sid)
+        if (not entry or entry.get('provider') != 'codex_local' or entry.get('available') is False
+                or agent_source_fingerprint(entry) != expected[sid] or entry.get('archived') is True
+                or agent_is_permanently_dismissed(state, entry) or agent_is_running(entry)):
+            raise ValueError('来源已变化、不可用或不再可核对；请重新导出整批')
+        kind = decision['decision']
+        quote = decision['evidence_quote'].strip()
+        if not agent_evidence_complete(entry) and kind != 'unknown':
+            raise ValueError('当前批次缺少完整或未截断的问题和最终答复，只能标记 unknown')
+        if kind in ('needs_user', 'no_action') and not agent_quote_matches(entry, quote):
+            raise ValueError('evidence_quote 必须逐字匹配当前问题或回答')
+        if kind == 'needs_user':
+            point = agent_concrete_review_point(decision.get('review_point'))
+            context = normalize_resume_context(decision['resume_context']) if 'resume_context' in decision else None
+            normalized.append({'id': sid, 'fingerprint': expected[sid], 'decision': kind,
+                               'reason': clean(decision['reason'], 600), 'evidence_quote': quote,
+                               'review_point': point, 'resume_context': context})
+        elif kind == 'no_action':
+            if decision.get('review_point') is not None or decision.get('resume_context') is not None:
+                raise ValueError('no_action 不能写入回顾点或接续说明')
+            if agent_current_pending(entry):
+                raise ValueError('已有当前待处理项不能用 no_action 关闭')
+            normalized.append({'id': sid, 'fingerprint': expected[sid], 'decision': kind,
+                               'reason': clean(decision['reason'], 600), 'evidence_quote': quote})
+        else:
+            if quote or decision.get('review_point') is not None or decision.get('resume_context') is not None:
+                raise ValueError('unknown 只能保留未知，不能伪造原文或待办')
+            normalized.append({'id': sid, 'fingerprint': expected[sid], 'decision': kind,
+                               'reason': clean(decision['reason'], 600), 'evidence_quote': ''})
+    return normalized
+
+
+def agent_verified_panel_report(state, decisions):
+    items = []
+    for decision in decisions:
+        if decision['decision'] != 'needs_user':
+            continue
+        entry = state['threads'][decision['id']]
+        note = entry.get('review_note', {})
+        if (note.get('based_on') != entry.get('fingerprint')
+                or not note.get('text')):
+            raise ValueError('已核对待办缺少当前回顾点')
+        item = {'id': entry['id'], 'title': entry.get('app_title') or entry.get('title'),
+                'fingerprint': entry['fingerprint'], 'updated_at': entry.get('updated_at'),
+                'project': project_for(state, entry), 'review_point': note['text'],
+                'review_point_source': 'assistant_summary',
+                'agent_source_digest': decision['fingerprint']}
+        context = resume_context(entry)
+        if context:
+            item['resume_context'] = context
+        items.append(item)
+    return {'generated_at': now(), 'items': items}
+
+
+def agent_apply(state, payload):
+    """Re-scan and validate a whole Agent batch before committing any decision."""
+    if not isinstance(payload, dict) or payload.get('schema_version') != AGENT_REVIEW_SCHEMA_VERSION:
+        raise ValueError('Agent 核对文件版本不兼容')
+    token = payload.get('batch_token')
+    review = state.get('agent_review', {})
+    original_batch = review.get('batches', {}).get(token) if isinstance(token, str) else None
+    if not original_batch or original_batch.get('source') != 'codex_local' or not original_batch.get('home'):
+        raise ValueError('找不到可用的 Agent 核对批次；请重新导出')
+    if original_batch.get('applied_at'):
+        raise ValueError('此 Agent 核对批次已提交；请重新导出，不会重复写入回执')
+    expected_controls = original_batch.get('control_snapshot')
+    if not isinstance(expected_controls, dict) or any(
+            expected_controls.get(sid) != agent_control_snapshot(state, sid)
+            for sid in original_batch.get('items', {})):
+        raise ValueError('导出后用户已在浮窗修改接手或忽略状态；请重新导出整批')
+    working = copy.deepcopy(state)
+    batch = working['agent_review']['batches'][token]
+    fresh_coverage = scan(working, Path(batch['home']).resolve())
+    failures = {failure.get('id') for failure in fresh_coverage.get('failures', [])}
+    pending = set(fresh_coverage.get('pending_ids', []))
+    batch_ids = set(batch.get('items', {}))
+    if batch_ids & (failures | pending):
+        raise ValueError('批次来源本轮无法稳定读取；请重新导出整批')
+    current_items, exclusions, missing_evidence, truncated_evidence, excerpt_count = agent_review_scope(
+        working, batch.get('explicit_exclude_ids', ()), batch.get('current_agent_thread') or '')
+    coverage = agent_coverage(fresh_coverage, exclusions, missing_evidence, truncated_evidence, excerpt_count)
+    coverage['eligible'] = len(current_items)
+    current_ids = {item['id'] for item in current_items}
+    if current_ids != batch_ids:
+        coverage['gaps'].append({'code': 'source_inventory_changed',
+                                 'count': len(current_ids ^ batch_ids)})
+        coverage['complete'] = False
+    decisions = agent_validate_payload(payload, batch, working)
+    attention = []
+    review_points = []
+    for decision in decisions:
+        if decision['decision'] == 'needs_user':
+            legacy_fingerprint = working['threads'][decision['id']]['fingerprint']
+            attention.append({'id': decision['id'], 'based_on': legacy_fingerprint,
+                              'source_thread': decision['id'], 'decision': 'needs_user',
+                              'reason': decision['reason'], 'pending_quote': decision['evidence_quote'],
+                              'review_point': decision['review_point'],
+                              'agent_source_digest': decision['fingerprint']})
+            note = {'id': decision['id'], 'based_on': legacy_fingerprint,
+                    'source_thread': decision['id'], 'text': decision['review_point']}
+            if decision.get('resume_context'):
+                note['resume_context'] = decision['resume_context']
+            review_points.append(note)
+        elif decision['decision'] == 'unknown':
+            attention.append({'id': decision['id'], 'based_on': working['threads'][decision['id']]['fingerprint'],
+                              'source_thread': decision['id'], 'decision': 'unknown',
+                              'reason': decision['reason']})
+    # Apply all validated assessments first. Re-import review points afterwards so
+    # an optional three-line context remains attached to the same verified evidence.
+    if attention:
+        import_app(working, {'attention_assessments': attention})
+    if review_points:
+        import_app(working, {'review_points': review_points})
+    verified = agent_verified_panel_report(working, decisions)
+    merge_panel_report(working, verified)
+    counts = {kind: sum(item['decision'] == kind for item in decisions) for kind in AGENT_DECISIONS}
+    applied_at = now()
+    batch.update({'coverage': coverage, 'applied_at': applied_at,
+                  'reviewed_count': len(decisions), 'decision_counts': counts})
+    receipt = {'batch_token': token, 'applied_at': applied_at,
+               'reviewed_count': len(decisions), 'needs_user_count': counts['needs_user'],
+               'no_action_count': counts['no_action'], 'unknown_count': counts['unknown'],
+               'coverage_complete': coverage['complete'],
+               'source_home': batch['source_home'], 'source_kind': batch['source_kind']}
+    working['agent_review']['last_receipt'] = receipt
+    result = agent_status(working)
+    result.update({'schema_version': AGENT_REVIEW_SCHEMA_VERSION, 'batch_token': token,
+                   'applied': counts})
+    return working, result
+
+
+def agent_status(state):
+    review = state.get('agent_review', {})
+    token = review.get('latest_batch_token') if isinstance(review, dict) else None
+    batch = review.get('batches', {}).get(token) if token else None
+    view = panel_view(state)
+    panel_count = sum(len(project['items']) for project in view['projects'])
+    if not batch:
+        coverage = {'source': 'codex_local', 'indexed': 0, 'eligible': 0, 'excluded': {},
+                    'read_this_pass': 0, 'pending_changed_or_unread': 0, 'failures': 0,
+                    'excerpt_count': 0,
+                    'gaps': [{'code': 'not_connected', 'count': 1}], 'complete': False,
+                    'scope': '尚未通过 Agent 明确授权并导出本机 Codex 来源。'}
+        return {'schema_version': AGENT_REVIEW_SCHEMA_VERSION, 'stage': 'not_started',
+                'coverage': coverage, 'reviewed_count': 0, 'panel_count': panel_count,
+                'has_pending_items': bool(panel_count),
+                'source_home': None, 'source_kind': None,
+                'last_review': review.get('last_receipt') if isinstance(review, dict) else None,
+                'next_step': '先允许一次只读导出，再逐条核对当前批次。',
+                'notice': ('尚未接入 Agent 真实记录；现有经典浮窗队列保持原样。'
+                           if panel_count else '尚未接入 Agent 真实记录，首次导出前没有可确认的浮窗回顾。')}
+    coverage = batch.get('coverage', {})
+    reviewed_count = batch.get('reviewed_count', 0) if batch.get('applied_at') else 0
+    counts = batch.get('decision_counts', {}) if batch.get('applied_at') else {}
+    unknown_count = counts.get('unknown', 0)
+    complete_batch = bool(batch.get('applied_at')) and reviewed_count == len(batch.get('items', {}))
+    if not complete_batch:
+        stage = 'awaiting_review'
+        next_step = '请完成当前批次的逐条核对。'
+    elif not coverage.get('complete') or unknown_count:
+        stage = 'needs_attention'
+        next_step = ('先补齐来源覆盖缺口。' if not coverage.get('complete')
+                     else '当前批次仍有 unknown，需要保留未知或重新核对。')
+    else:
+        stage = 'ready'
+        next_step = ('当前完整批次已核对；浮窗有待处理项可直接打开。'
+                     if panel_count else '当前完整批次已核对；没有仍需显示的事项。')
+    return {'schema_version': AGENT_REVIEW_SCHEMA_VERSION, 'stage': stage,
+            'coverage': coverage, 'reviewed_count': reviewed_count, 'panel_count': panel_count,
+            'has_pending_items': bool(panel_count),
+            'source_home': batch.get('source_home', batch.get('home')),
+            'source_kind': batch.get('source_kind', 'custom_codex'),
+            'last_review': review.get('last_receipt'), 'next_step': next_step,
+            'notice': '安装成功本身不代表已接入或已完成核对。'}
 
 
 def main():
@@ -981,6 +1454,16 @@ def main():
     s = sub.add_parser('scan')
     s.add_argument('--home', type=Path, default=Path.home() / '.codex')
     s.add_argument('--max-files', type=int, default=128)
+    e = sub.add_parser('agent-export')
+    e.add_argument('--home', type=Path, required=True)
+    e.add_argument('--allow-read', action='store_true',
+                   help='明确授权仅只读扫描此 Codex 来源')
+    e.add_argument('--exclude-id', action='append', default=[])
+    e = sub.add_parser('agent-apply')
+    e.add_argument('file', type=Path)
+    e.add_argument('--allow-read', action='store_true',
+                   help='明确授权重新只读核对批次绑定的 Codex 来源')
+    sub.add_parser('agent-status')
     for command in ('import-app', 'feedback', 'preferences'):
         p = sub.add_parser(command)
         p.add_argument('file', type=Path)
@@ -1000,6 +1483,8 @@ def main():
     args = parser.parse_args()
     with state_lock(args.state_dir, timeout=2 if args.command.startswith('panel-') else 0):
         state = read_state(args.state_dir)
+        if args.command in ('agent-export', 'agent-apply') and not args.allow_read:
+            raise ValueError('Agent 接口需要明确 --allow-read 才会读取 Codex 来源')
         if args.command.startswith('panel-'):
             path = args.state_dir / 'latest-report.json'
             latest = json.loads(path.read_text()) if path.exists() else None
@@ -1007,6 +1492,12 @@ def main():
                       else panel_action(state, latest, args.id, args.action, args.token))
         elif args.command == 'scan':
             result = scan(state, args.home.resolve(), max_files=args.max_files)
+        elif args.command == 'agent-export':
+            result = agent_export(state, args.home, args.exclude_id)
+        elif args.command == 'agent-apply':
+            state, result = agent_apply(state, json.loads(args.file.read_text()))
+        elif args.command == 'agent-status':
+            result = agent_status(state)
         elif args.command == 'import-app':
             import_app(state, json.loads(args.file.read_text()))
             result = state['sources'].get('app', {})
@@ -1029,7 +1520,7 @@ def main():
         else:
             latest = json.loads((args.state_dir / 'latest-report.json').read_text())
             result = acknowledge(state, latest, args.token, args.presented_at)
-        if args.command != 'panel-read':
+        if args.command not in ('panel-read', 'agent-status'):
             write_json(args.state_dir / 'state.json', state)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
