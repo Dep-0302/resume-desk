@@ -1,0 +1,35 @@
+name: Check
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      package_preview:
+        description: 'Seal and package new preview build artifacts'
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: python3 -m unittest discover -s Recovery -p 'test_*.py'
+  mac:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - run: zsh scripts/check.sh
+      - run: zsh scripts/check-native.sh
+      - if: github.event_name == 'workflow_dispatch' && inputs.package_preview
+        run: zsh scripts/seal-preview.sh
+      - if: github.event_name == 'workflow_dispatch' && inputs.package_preview
+        run: zsh scripts/package.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: github.event_name == 'workflow_dispatch' && inputs.package_preview
+        with:
+          name: ResumeDesk-macOS-preview
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
